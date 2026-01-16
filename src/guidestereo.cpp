@@ -24,9 +24,10 @@
 
 #include <opencv2/opencv.hpp>
 #include <libserial/SerialPort.h>
+#include <signal.h>
 
 int if_save = 0;
-std::atomic<int> if_sync{-1};
+std::vector<std::atomic<int>> if_sync(2);  // -1: no change, 0: sync off, 1: sync on
 std::vector<int> is_sync_on = {0, 0};
 const int kReqCount = 4;
 
@@ -485,20 +486,22 @@ void sync_serial(int port_id)
     while(!quitFlag.load()){
         std::unique_lock<std::mutex> lock(lr_serial_mutex[port_id]);
         lr_serial_cv[port_id].wait(lock, [&] {
-            return (if_sync != -1) || quitFlag.load();
+            return (if_sync[port_id].load() != -1) || quitFlag.load();
         });
         if (quitFlag.load()) break;
+        int cmd = if_sync[port_id].load();
+        lock.unlock();
+        if_sync[port_id].store(-1);
         try {
-            if (if_sync.load() == 1 && is_sync_on[port_id] == 0){ // sync on
+            if (cmd == 1 && is_sync_on[port_id] == 0){ // sync on
                 serials[port_id].Write(sync_on);
                 is_sync_on[port_id] = 1;
+                std::cout << "Port " << port_id << " Sync on\n" << std::flush;
             }
-            if (if_sync.load() == 0 && is_sync_on[port_id] == 1){ //sync off
+            if (cmd == 0 && is_sync_on[port_id] == 1){ //sync off
                 serials[port_id].Write(sync_off);
                 is_sync_on[port_id] = 0;
-            }
-            if (is_sync_on[0] == is_sync_on[1]){
-                if_sync.store(-1);
+                std::cout << "Port " << port_id << " Sync off\n" << std::flush;
             }
         }
         catch (const std::exception& e) {
@@ -516,11 +519,11 @@ void recv_serial(int port_id)
     {
         try {
             unsigned char byte;
+            if (!quitFlag.load()) break;
             serials[port_id].ReadByte(byte);
-
             if (byte == 0x55) {
                 buffer.clear();
-                while(true){
+                while(!quitFlag.load()){
                     serials[port_id].ReadByte(byte);
                     if (byte == 0xF0) break;
                     buffer.push_back(byte);
@@ -542,7 +545,22 @@ void recv_serial(int port_id)
     }
 }
 
+void signal_handler(int)
+{
+    quitFlag.store(true);
+    for (int i = 0; i < 2; ++i) {
+        lr_cv[i].notify_all();
+        lr_serial_cv[i].notify_all();
+        if(serials[i].IsOpen()){
+            serials[i].Close();
+        }
+    }
+}
+
 int main(int argc, char **argv) {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     int trigger_fps = 30;
     outputdir = "./capture";
 
@@ -568,6 +586,10 @@ int main(int argc, char **argv) {
     const int numConsumers = 2;
     for (int i = 0; i < numConsumers; ++i) {
         consumers.emplace_back(consumer, i);
+    }
+
+    for (auto& v : if_sync) {
+        v.store(-1);   //
     }
 
     // Initialize left and right cameras
@@ -626,9 +648,8 @@ int main(int argc, char **argv) {
                 StampedFrame frame;
                 {
                     std::unique_lock<std::mutex> lock(lr_queue_mutex[i]);
-                    while (lr_output_queue[i].empty()) {
-                        lr_cv[i].wait(lock);
-                    }
+                    lr_cv[i].wait(lock, [&]{ return !lr_output_queue[i].empty() || quitFlag.load(); });
+                    if (quitFlag.load()) break;
                     frame = lr_output_queue[i].front();
                 }
 
@@ -645,15 +666,32 @@ int main(int argc, char **argv) {
 
     std::string sync_input;
     std::thread interface_t([&]() { // Interface thread
+        std::cout << "External sync on (1) or off (0): " << std::flush;
         while (!quitFlag.load()) {
-            std::cout << "External sync on (1) or off (0): ";
-            std::cin >> sync_input;
-            if (sync_input == "1") {
-                if_sync.store(1);
-                std::cout << "Sync on command sent.\n";
-            } else if (sync_input == "0") {
-                if_sync.store(0);
-                std::cout << "Sync off command sent.\n";
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(STDIN_FILENO, &rfds);;
+            timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000; // 100 ms
+            int ret = select(STDIN_FILENO + 1, &rfds, nullptr, nullptr, &tv);
+            if (ret > 0 && FD_ISSET(STDIN_FILENO, &rfds)) {
+                std::cin >> sync_input;
+                if (sync_input == "1") {
+                    for (int i = 0; i < 2; ++i) {
+                        if_sync[i].store(1);
+                        lr_serial_cv[i].notify_one();
+                    }
+                    std::cout << "Sync on command sent.\n";
+                } else if (sync_input == "0") {
+                    for (int i = 0; i < 2; ++i) {
+                        if_sync[i].store(0);
+                        lr_serial_cv[i].notify_one();
+                    }
+                    std::cout << "Sync off command sent.\n";
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                std::cout << "External sync on (1) or off (0): " << std::flush;
             }
         }
     });
@@ -662,6 +700,7 @@ int main(int argc, char **argv) {
     while (!quitFlag.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    cv::destroyAllWindows();
 
     for (auto& t : producers) {
         t.join();
@@ -670,16 +709,16 @@ int main(int argc, char **argv) {
     for (auto& t : consumers) {
         t.join();
     }
-
+    
     for (auto& t : display_threads) {
         t.join();
     }
 
-    for(auto& t : query_threads) {
+    for(auto& t : recv_threads) {
         t.join();
     }
 
-    for(auto& t : recv_threads) {
+    for(auto& t : query_threads) {
         t.join();
     }
 
