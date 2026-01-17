@@ -100,5 +100,6 @@ Port 1 Sync on
 
 ## TODO
 
-* To capsulate functionality in a class
-* ARM64 Architecture Adaption Test
+* Functionality encapsulated in a class
+* ARM64 Adaption Test
+* ROS Adaption

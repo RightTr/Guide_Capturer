@@ -473,7 +473,6 @@ void query_serial(int port_id)
         
         try {
             serials[port_id].Write(query_cmd);
-            unsigned char byte;
         }
         catch (const std::exception& e) {
             std::cerr << "Query Port " << port_id << " error: " << e.what() << std::endl;
@@ -519,7 +518,7 @@ void recv_serial(int port_id)
     {
         try {
             unsigned char byte;
-            if (!quitFlag.load()) break;
+            if (quitFlag.load()) break;
             serials[port_id].ReadByte(byte);
             if (byte == 0x55) {
                 buffer.clear();

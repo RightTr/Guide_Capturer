@@ -1,14 +1,14 @@
 #!/bin/bash
 
 PROGRAM="./build/guidestereo"
-RUN_TIME=10
-PAUSE_TIME=5
+RUN_TIME=60
+PAUSE_TIME=90
 
 trap "echo 'User interrupted, exiting'; exit 0" INT
 
 while true; do
     HOST_TIME=$(date +"%Y%m%d_%H%M%S")
-    ARG_PATH="./capture/${HOST_TIME}"
+    ARG_PATH="./capture/sequence1/${HOST_TIME}"
 
     echo "Starting program..."
     $PROGRAM "1" "$ARG_PATH" < /dev/tty &
