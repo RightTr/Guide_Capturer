@@ -23,11 +23,11 @@
 #include <vector>
 
 #include <opencv2/opencv.hpp>
+#include <librealsense2/rs.hpp>
 #include <libserial/SerialPort.h>
 #include <signal.h>
 
 int if_save = 0;
-std::vector<std::atomic<int>> if_sync(2);  // -1: no change, 0: sync off, 1: sync on
 const int kReqCount = 4;
 
 struct buffer {
@@ -68,6 +68,8 @@ std::vector<SerialPort> serials(2);
 
 std::atomic<bool> quitFlag(false);  // Flag to signal consumer to stop
 
+std::vector<std::atomic<bool>> serial_flag(2);  // Flag to signal serial communication
+
 typedef std::chrono::time_point<std::chrono::system_clock> TimePoint;
 
 struct ParamData {
@@ -88,7 +90,7 @@ struct ParamData {
     uint16_t region_avg_temp; 
 };
 
-struct StampedFrame  {
+struct StampedGuideFrame  {
     int cam_id;
     cv::Mat gray_image;
     cv::Mat temperature_celsius;
@@ -97,18 +99,29 @@ struct StampedFrame  {
     long sensor_sec, sensor_microsec;
 };
 
+struct StampedRealSenseFrame  {
+    cv::Mat color_image;
+    cv::Mat depth_image_raw;
+    long host_sec, host_nanosec;
+    long sensor_sec, sensor_microsec;
+};
+
 std::string outputdir;
 std::ofstream lr_time_stream[2];
 std::ofstream lr_param_stream[2];
 std::ofstream lr_temp_stream[2];
+std::ofstream rs_time_stream;
 
 // mutex to protect left and right camera's raw buffers
 std::mutex lr_mutex[2];
 
 // mutex to protect the output queue
 std::mutex lr_queue_mutex[2];
-std::condition_variable lr_cv[2];     // Condition variable for synchronization
-std::queue<StampedFrame> lr_output_queue[2];      // Shared queue
+std::mutex rgbd_queue_mutex;
+std::condition_variable lr_cv[2];
+std::condition_variable rgbd_cv;
+std::queue<StampedGuideFrame> lr_output_queue[2];      // Shared queue
+std::queue<StampedRealSenseFrame> rgbd_output_queue;
 
 int lr_fd[2] = { -1, -1 };
 struct buffer *lr_buffers[2] = { nullptr, nullptr };
@@ -235,20 +248,18 @@ void process_frame(struct v4l2_buffer *buf, void *mmap_buffer, int cam_id, TimeP
     const int MAX_QUEUE_SIZE = 5;   // Max number of items in the queue
     {
         std::unique_lock<std::mutex> lock(lr_queue_mutex[cam_id]);
-
-        lr_cv[cam_id].wait(lock, [&] {
-            return lr_output_queue[cam_id].size() < MAX_QUEUE_SIZE || quitFlag.load();
-        });
-        
-        if (!quitFlag.load()) return ;
-        lr_output_queue[cam_id].emplace(StampedFrame{cam_id, gray_image, temperature_celsius, param_data, sec.count(), nanosec, tv.tv_sec, tv.tv_usec});
+        while (lr_output_queue[cam_id].size() >= MAX_QUEUE_SIZE) {
+            // Wait until there is space in the queue
+            std::cout << "Producer " << cam_id << ": Queue is full, waiting...\n";
+            lr_cv[cam_id].wait(lock);  // Wait until a consumer consumes an item
+        }
+        lr_output_queue[cam_id].emplace(StampedGuideFrame{cam_id, gray_image, temperature_celsius, param_data, sec.count(), nanosec, tv.tv_sec, tv.tv_usec});
     }
     lr_cv[cam_id].notify_one();  // Notify consumers that new data is available
 
 }
 
-
-void save_frame(const StampedFrame &frame) {
+void save_guide_frame(const StampedGuideFrame& frame) {
     lr_time_stream[frame.cam_id] << frame.host_sec << "." << std::setw(9) << std::setfill('0') << frame.host_nanosec
                 << "," << frame.sensor_sec << "." << std::setw(6) << std::setfill('0') << frame.sensor_microsec << std::endl;
     lr_param_stream[frame.cam_id] << frame.host_sec << "." << std::setw(9) << std::setfill('0') << frame.host_nanosec
@@ -280,10 +291,25 @@ void save_frame(const StampedFrame &frame) {
     saveCv32FAs16BitPNG(frame.temperature_celsius, ss.str());
 }
 
-void consumer(int id)
+void save_realsense_frame(const StampedRealSenseFrame& frame){
+    rs_time_stream << frame.host_sec << "." << std::setw(9) << std::setfill('0') << frame.host_nanosec
+                << "," << frame.sensor_sec << "." << std::setw(6) << std::setfill('0') << frame.sensor_microsec << std::endl;
+
+    std::ostringstream ss;
+    ss << outputdir  << "/realsense/rgb/" <<
+        frame.host_sec << "." << std::setw(9) << std::setfill('0') << frame.host_nanosec << ".png";
+    cv::imwrite(ss.str(), frame.color_image);
+
+    ss.str(""); ss.clear();
+    ss << outputdir << "/realsense/depth_raw/" << 
+        frame.host_sec << "." << std::setw(9) << std::setfill('0') << frame.host_nanosec << ".png";
+    cv::imwrite(ss.str(), frame.depth_image_raw);
+}
+
+void guide_consumer(int id)
 {
     while (!quitFlag.load()) {
-        StampedFrame frame;
+        StampedGuideFrame frame;
         {
             std::unique_lock<std::mutex> lock(lr_queue_mutex[id]);
             lr_cv[id].wait(lock, [&]{ return !lr_output_queue[id].empty() || quitFlag.load(); });
@@ -293,7 +319,7 @@ void consumer(int id)
         }
         lr_cv[id].notify_one();  // Notify producers that space is available in the queue
         
-        if (if_save) save_frame(frame); 
+        if (if_save) save_guide_frame(frame); 
         else std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     std::cout << "Closing time stream " << id << std::endl;
@@ -304,7 +330,52 @@ void consumer(int id)
     lr_temp_stream[id].close();
 }
 
-int init_camera(const char *device_name, int *fd, struct buffer **buffers, int width, int height) {
+void realsense_consumer(){
+    while (!quitFlag.load()) {
+        StampedRealSenseFrame frame;
+        {
+            std::unique_lock<std::mutex> lock(rgbd_queue_mutex);
+            rgbd_cv.wait(lock, [&]{ return !rgbd_output_queue.empty() || quitFlag.load(); });
+            if (quitFlag.load()) break;
+            frame = rgbd_output_queue.front();
+            rgbd_output_queue.pop();
+        }
+        rgbd_cv.notify_one();  // Notify producers that space is available in the queue
+        
+        if (if_save) save_realsense_frame(frame); 
+        else std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::cout << "Closing realsense time stream "  << std::endl;
+    rs_time_stream.close();
+}
+
+void save_realsense_intrinsics(const rs2::pipeline_profile& pip_profile, const std::string& output_dir) {
+    std::string filename = output_dir + "/realsense/realsense_intrinsics.txt";
+    std::ofstream outfile(filename);
+    if (!outfile.is_open()) {
+        std::cerr << "[realsense] Failed to open file to save intrinsics: " << filename << std::endl;
+        return;
+    }
+
+    auto stream_profiles = pip_profile.get_streams();
+    for (const auto& stream_profile : stream_profiles) {
+        if (auto video_profile = stream_profile.as<rs2::video_stream_profile>()) {
+            rs2_intrinsics intrinsics = video_profile.get_intrinsics();
+            
+            outfile << "--- Stream: " << video_profile.stream_name() << " (" << rs2_format_to_string(video_profile.format()) << ") ---\n";
+            outfile << "  Resolution (Width x Height): " << intrinsics.width << " x " << intrinsics.height << "\n";
+            outfile << "  Principal Point (ppx, ppy): (" << intrinsics.ppx << ", " << intrinsics.ppy << ")\n";
+            outfile << "  Focal Length (fx, fy): (" << intrinsics.fx << ", " << intrinsics.fy << ")\n";
+            outfile << "  Distortion Model: " << rs2_distortion_to_string(intrinsics.model) << "\n";
+            outfile << "  Distortion Coefficients: [" << intrinsics.coeffs[0] << ", " << intrinsics.coeffs[1] << ", "
+                    << intrinsics.coeffs[2] << ", " << intrinsics.coeffs[3] << ", " << intrinsics.coeffs[4] << "]\n\n";
+        }
+    }
+    outfile.close();
+    std::cout << "[realsense] Intrinsic parameters saved to " << filename << std::endl;
+}
+
+int init_v4l2cam(const char *device_name, int *fd, struct buffer **buffers, int width, int height) {
     *fd = open(device_name, O_RDWR);
     if (*fd == -1) {
         perror("Opening video device");
@@ -393,11 +464,14 @@ void prepare_dirs(const std::string& outputdir) {
     try {
         std::filesystem::create_directories(outputdir + "/left/image");
         std::filesystem::create_directories(outputdir + "/left/temperature");
-
         std::filesystem::create_directories(outputdir + "/right/image");
         std::filesystem::create_directories(outputdir + "/right/temperature");
+        std::filesystem::create_directories(outputdir + "/realsense/rgb");
+        std::filesystem::create_directories(outputdir + "/realsense/depth_raw");
+        std::filesystem::create_directories(outputdir + "/realsense/depth_vis");
         lr_time_stream[0].open(outputdir + "/left/times.txt", std::ios::out);
         lr_time_stream[1].open(outputdir + "/right/times.txt", std::ios::out);
+        rs_time_stream.open(outputdir + "/realsense/times.txt", std::ios::out);
         lr_param_stream[0].open(outputdir + "/left/params.txt", std::ios::out);
         lr_param_stream[1].open(outputdir + "/right/params.txt", std::ios::out);
         lr_temp_stream[0].open(outputdir + "/left/focal_temperature.txt", std::ios::out);
@@ -407,7 +481,7 @@ void prepare_dirs(const std::string& outputdir) {
     }
 }
 
-void producer(int fps, int id)
+void guide_producer(int fps, int id)
 {
     struct pollfd pfd;
     pfd.fd = lr_fd[id];
@@ -415,8 +489,7 @@ void producer(int fps, int id)
     auto last_frame_time = std::chrono::system_clock::now();
     long expected_delta = 1000000 / fps; // in microsecs.
     while (!quitFlag.load()) {
-        int ret = poll(&pfd, 1, 33);
-        if (quitFlag.load()) break;
+        int ret = poll(&pfd, 1, -1);  // Wait indefinitely for an event
         if (ret < 0) {
             perror("poll");
             break;
@@ -458,6 +531,92 @@ void producer(int fps, int id)
     }
     free(lr_buffers[id]);
     close(lr_fd[id]);
+}
+
+void realsense_producer(const std::string& rs_device){
+    rs2::pipeline pipline;
+    rs2::config cfg;
+    if (!rs_device.empty()) cfg.enable_device(rs_device);
+
+    // --- Declare ADVANCED post-processing blocks ---
+    rs2::align align(RS2_STREAM_COLOR);
+    rs2::spatial_filter spatial_filter;
+    rs2::temporal_filter temporal_filter;
+    
+    // --- Configure the Spatial Filter ---
+    // Hole filling is disabled on the spatial filter.
+    spatial_filter.set_option(RS2_OPTION_FILTER_MAGNITUDE, 2.0f);
+    spatial_filter.set_option(RS2_OPTION_FILTER_SMOOTH_ALPHA, 0.5f);
+    spatial_filter.set_option(RS2_OPTION_FILTER_SMOOTH_DELTA, 20.0f);
+    spatial_filter.set_option(RS2_OPTION_HOLES_FILL, 0);
+
+    try {
+        const int width = 640;
+        const int height = 480;
+        cfg.enable_stream(RS2_STREAM_COLOR, width, height, RS2_FORMAT_BGR8, 30);
+        cfg.enable_stream(RS2_STREAM_DEPTH, width, height, RS2_FORMAT_Z16, 30);
+        
+        rs2::pipeline_profile profile = pipline.start(cfg);
+        
+        if(if_save) save_realsense_intrinsics(profile, outputdir);
+
+        rs2::depth_sensor depth_sensor = profile.get_device().first<rs2::depth_sensor>();
+
+        if (depth_sensor.supports(RS2_OPTION_LASER_POWER)) {
+            float max_laser = depth_sensor.get_option_range(RS2_OPTION_LASER_POWER).max;
+            depth_sensor.set_option(RS2_OPTION_LASER_POWER, max_laser);
+            std::cout << "[realsense] Laser power set to max: " << max_laser << std::endl;
+        }
+        
+        if(if_save){
+            float depth_scale = depth_sensor.get_depth_scale();
+            std::ofstream scale_file(outputdir + "/realsense/depth_scale.txt");
+            scale_file << std::fixed << std::setprecision(10) << depth_scale;
+            scale_file.close();
+        }
+
+    } catch (const rs2::error& e) {
+        std::cerr << "[realsense] Error starting pipeline: " << e.what() << std::endl;
+        quitFlag.store(true);
+    }
+    while (!quitFlag.load()) {
+        rs2::frameset frames;
+        if (!pipline.poll_for_frames(&frames)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+        frames = align.process(frames);
+
+        rs2::video_frame color_frame = frames.get_color_frame();
+        rs2::depth_frame depth_frame = frames.get_depth_frame();
+        if(quitFlag.load()) break;
+        if (!color_frame || !depth_frame) continue;
+
+        depth_frame = spatial_filter.process(depth_frame);
+        depth_frame = temporal_filter.process(depth_frame);
+
+        auto now = std::chrono::system_clock::now();
+        long rs_timestamp_ms = (long)color_frame.get_timestamp();
+        
+        const int frame_width = color_frame.get_width();
+        const int frame_height = color_frame.get_height();
+        
+        cv::Mat rs_rgb(cv::Size(frame_width, frame_height), CV_8UC3, (void*)color_frame.get_data());
+        cv::Mat rs_depth_raw(cv::Size(frame_width, frame_height), CV_16UC1, (void*)depth_frame.get_data());
+
+        auto sec = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch());
+        long nanosec = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch() - sec).count();
+
+        const int MAX_QUEUE_SIZE = 5;
+        {
+            std::unique_lock<std::mutex> lock(rgbd_queue_mutex);
+            rgbd_cv.wait(lock, [&]{return rgbd_output_queue.size() < MAX_QUEUE_SIZE;});
+            rgbd_output_queue.emplace(StampedRealSenseFrame{rs_rgb.clone(), rs_depth_raw.clone(), sec.count(), nanosec, rs_timestamp_ms / 1000, (rs_timestamp_ms % 1000) * 1000});
+        }
+        rgbd_cv.notify_one();
+    }
+    pipline.stop();
 }
 
 void serial_worker(int port_id)
@@ -557,27 +716,28 @@ int main(int argc, char **argv) {
 
     if (if_save) prepare_dirs(outputdir);
 
-    const char* dev_left  =
+    const char* dev_left =
         "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2:1.0-video-index0"; // left camera
     const char* dev_right =
         "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:8:1.0-video-index0"; // right camera
+    const std::string dev_rs = "253822301280"; // realsense
 
     std::vector<std::thread> consumers;
     // Start consumer threads
-    const int numConsumers = 2;
-    for (int i = 0; i < numConsumers; ++i) {
-        consumers.emplace_back(consumer, i);
+    for (int i = 0; i < 2; ++i) {
+        consumers.emplace_back(guide_consumer, i);
     }
+    consumers.emplace_back(realsense_consumer);
 
     for (auto& cmd : serial_cmd) {
         cmd.store(SerialCmd::NONE);
     }
 
     // Initialize left and right cameras
-    if (init_camera(dev_left, &lr_fd[0], &lr_buffers[0], 1280, 513) != 0) {
+    if (init_v4l2cam(dev_left, &lr_fd[0], &lr_buffers[0], 1280, 513) != 0) {
         return EXIT_FAILURE;
     }
-    if (init_camera(dev_right, &lr_fd[1], &lr_buffers[1], 1280, 513) != 0) {
+    if (init_v4l2cam(dev_right, &lr_fd[1], &lr_buffers[1], 1280, 513) != 0) {
         free(lr_buffers[0]);
         close(lr_fd[0]);
         return EXIT_FAILURE;
@@ -602,20 +762,20 @@ int main(int argc, char **argv) {
 
     std::vector<std::thread> producers;
     for (int i = 0; i < 2; ++i) {
-        producers.emplace_back(producer, trigger_fps, i);
+        producers.emplace_back(guide_producer, trigger_fps, i);
     }
+    producers.emplace_back(realsense_producer, dev_rs);
 
     std::vector<std::thread> serial_worker_threads;
     for (int i = 0; i < 2; ++i) {
         serial_worker_threads.emplace_back(serial_worker, i);
     }
 
-    const int numDisplays = 2;
     std::vector<std::thread> display_threads;
-    for (int i = 0; i < numDisplays; ++i) {
+    for (int i = 0; i < 2; ++i) {
         display_threads.emplace_back([i]() {
             while(!quitFlag.load()){
-                StampedFrame frame;
+                StampedGuideFrame frame;
                 {
                     std::unique_lock<std::mutex> lock(lr_queue_mutex[i]);
                     lr_cv[i].wait(lock, [&]{ return !lr_output_queue[i].empty() || quitFlag.load(); });
@@ -633,6 +793,24 @@ int main(int argc, char **argv) {
             }   
         });
     }
+    display_threads.emplace_back([](){
+         while(!quitFlag.load()){
+            StampedRealSenseFrame frame;
+            {
+                std::unique_lock<std::mutex> lock(rgbd_queue_mutex);
+                rgbd_cv.wait(lock, [&]{ return !rgbd_output_queue.empty() || quitFlag.load(); });
+                if (quitFlag.load()) break;
+                frame = rgbd_output_queue.front();
+            }
+
+            cv::Mat gray_norm;
+            cv::normalize(frame.depth_image_raw, gray_norm, 0, 255, cv::NORM_MINMAX);
+            gray_norm.convertTo(gray_norm, CV_8UC1);
+            cv::imshow("RGB", frame.color_image);
+            cv::imshow("Depth_vis", gray_norm);
+            cv::waitKey(1);
+        }   
+    });
 
     std::string sync_input;
     std::thread interface_t([&]() { // Interface thread
@@ -659,7 +837,6 @@ int main(int argc, char **argv) {
             }
         }
     });
-
 
     while (!quitFlag.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));

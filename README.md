@@ -1,8 +1,18 @@
-# Guide Thermal Infrared Camera
+# Camera Capturer
 
-## Stereo Camera
+Camera capturer implementation using v4l2.
 
-1.Bind the video devices of two camera heads to fixed physical USB ports.
+* Guide Thermal Infrared Camera (Support external trigger synchronization)
+
+Guide Official SDK: Please refer to *./Linux_USB3.0_V2_0_0-x86_64-linux-gnu-gcc-9_4_0_20251201*
+
+* Realsense D455f RGBD Camera (Support external trigger synchronization)
+
+## 1. Prerequisites
+
+### 1.1 Bind Video Devices to Fixed USB Ports
+
+Bind the video devices of two camera heads to fixed physical USB ports.
 
 Ensure each camera head is bound to a fixed physical USB port.
 
@@ -32,7 +42,9 @@ ffplay -f v4l2   -pixel_format yuyv422   -video_size 1280x513   -framerate 30   
 ffplay -f v4l2   -pixel_format yuyv422   -video_size 1280x513   -framerate 30   /dev/v4l/by-path/pci-0000:00:14.0-usb-0:2:1.0-video-index0
 ```
 
-2.Bind the serial devices of two camera heads to fixed physical USB ports.
+### 1.2 Bind Serial Devices to Fixed USB Ports
+
+Bind the serial devices of two camera heads to fixed physical USB ports.
 
 Make sure each camera head is bound to a fixed physical USB port.
 
@@ -69,19 +81,62 @@ sudo udevadm trigger
 
 Now, /dev/guide_left and /dev/guide_right refer to fixed USB ports.
 
-## Official SDK
-
-Please refer to *Linux_USB3.0_V2_0_0-x86_64-linux-gnu-gcc-9_4_0_20251201*
-
-## Usage
-
-* Mono
+### 1.3 Check RealSense Serial Number
 
 ```bash
-./build/guidemono <camera_id> <max_fps> (if_save) (<output_dir>) (<serial_port_id>)
+rs-enumerate-devices
+Device info: 
+    Name                          : 	Intel RealSense D455F
+    Serial Number                 : 	253822301280 # Serial Number
+    Firmware Version              : 	5.15.1.55
+    Recommended Firmware Version  : 	5.16.0.1
+    Physical Port                 : 	/sys/devices/pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/video4linux/video8
 ```
 
-* Stereo
+Please modify the variable *dev_rs* to the number above in the source code.
+
+## 2. Build
+
+### 2.1 Direct Build
+
+```bash
+git clone https://github.com/RightTr/Camera_Capturer.git
+
+cd Camera_Capturer
+mkdir build && cd build
+
+cmake ..
+make
+```
+
+### 2.2 Run with ROS
+
+```bash
+mkdir cap_ws && cd cap_ws
+mkdir src && cd src
+
+git clone https://github.com/RightTr/Camera_Capturer.git
+
+cd Camera_Capturer
+
+# ROS1
+./build.sh ROS1
+
+# ROS2 Humble
+./build.sh humble
+```
+
+## 3. Usage
+
+### 3.1 Direct Run
+
+* Guide Mono
+
+```bash
+./build/guidemono <camera_id> <max_fps> (<if_save>) (<output_dir>) (<serial_port_id>)
+```
+
+* Guide Stereo
 
 Please follow the instuctions above to check video streams and serial devices of camera heads, and modify the source code accordingly.
 
@@ -98,8 +153,45 @@ Port 0 Sync on
 Port 1 Sync on
 ```
 
+* RGBDT Capturer with Guide Stereo and RealSense Camera
+
+```bash
+./build/camera_RGBDT (<if_save>) (<output_dir>)
+```
+
+Following the instructions above to turn on Guide Stereo external trigger synchronization.
+
+### 3.2 Run with ROS
+
+* Guide Stereo Node
+
+```bash
+cd cap_ws
+
+# ROS1
+source devel/setup.bash
+rosrun camera_capturer guidestereo_node
+
+# ROS 2
+source install/setup.bash
+ros2 run camera_capturer guidestereo_node
+```
+
+Enable external trigger synchronization via the */guidecam/sync* topic
+
+```bash
+# ROS1
+rostopic pub -1 /guidecam/sync std_msgs/Int32 "{data: 1}" # Sync on
+rostopic pub -1 /guidecam/sync std_msgs/Int32 "{data: 0}" # Sync off
+
+# ROS2
+ros2 topic pub --once /guidecam/sync std_msgs/Int32 "{data: '1'}" # Sync on
+ros2 topic pub --once /guidecam/sync std_msgs/Int32 "{data: '0'}" # Sync off
+```
+
 ## TODO
 
-* Functionality encapsulated in a class
 * ARM64 Adaption Test
-* ROS Adaption
+* ROS1/ROS2 Adaption
+* RealSense Color Image Visualization Fault
+* RealSense External Trigger Synchronization Test

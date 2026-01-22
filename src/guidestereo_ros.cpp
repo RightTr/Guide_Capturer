@@ -42,12 +42,30 @@ using ImagePublisher = ros::Publisher;
 using ImageMsgPtr = sensor_msgs::ImagePtr;
 #elif defined(USE_ROS2)
 using ImagePublisher = rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr;
-using ImageMsgPtr = sensor_msgs::msg::ImagePtr;
+using ImageMsgPtr = sensor_msgs::msg::Image::SharedPtr;
 #endif
 
+inline bool ros_ok()
+{
+#ifdef USE_ROS1
+    return ros::ok();
+#elif defined(USE_ROS2)
+    return rclcpp::ok();
+#else
+    return true;
+#endif
+}
+
+enum class SerialCmd {
+    NONE,
+    SYNC_ON,
+    SYNC_OFF,
+    QUERY
+};
+
+std::vector<std::atomic<SerialCmd>> serial_cmd(2);
+
 int if_save = 0;
-std::vector<std::atomic<int>> if_sync(2);  // -1: no change, 0: sync off, 1: sync on
-std::vector<int> is_sync_on = {0, 0};
 const int kReqCount = 4;
 
 struct buffer {
@@ -124,8 +142,8 @@ std::queue<StampedFrame> lr_output_queue[2];      // Shared queue
 int lr_fd[2] = { -1, -1 };
 struct buffer *lr_buffers[2] = { nullptr, nullptr };
 
-std::mutex lr_serial_mutex[2];
-std::condition_variable lr_serial_cv[2];
+std::mutex serial_mutex[2];
+std::condition_variable serial_cv[2];
 
 std::string cameraName(int cam_id) {
     if (cam_id == 0) {
@@ -213,11 +231,10 @@ void process_frame(struct v4l2_buffer *buf, void *mmap_buffer, int cam_id, TimeP
     cv::Mat gray_image;
     cv::Mat temperature_celsius;
     ParamData param_data;
-    {
-        std::lock_guard<std::mutex> lock(lr_serial_mutex[cam_id]);
-        serial_flag[cam_id] = true;
-    }
-    lr_serial_cv[cam_id].notify_one();
+
+    serial_cmd[cam_id].store(SerialCmd::QUERY);
+    serial_cv[cam_id].notify_one();
+
     timeval tv;
     {
         std::lock_guard<std::mutex> lock(lr_mutex[cam_id]);
@@ -241,56 +258,70 @@ void process_frame(struct v4l2_buffer *buf, void *mmap_buffer, int cam_id, TimeP
     const int MAX_QUEUE_SIZE = 5;   // Max number of items in the queue
     {
         std::unique_lock<std::mutex> lock(lr_queue_mutex[cam_id]);
-        while (lr_output_queue[cam_id].size() >= MAX_QUEUE_SIZE) {
-            // Wait until there is space in the queue
-            std::cout << "Producer " << cam_id << ": Queue is full, waiting...\n";
-            lr_cv[cam_id].wait(lock);  // Wait until a consumer consumes an item
+
+        lr_cv[cam_id].wait(lock, [&] {
+            return lr_output_queue[cam_id].size() < MAX_QUEUE_SIZE || !ros_ok();
+        });
+
+        if (!ros_ok()) {
+            return;
         }
         lr_output_queue[cam_id].emplace(StampedFrame{cam_id, gray_image, temperature_celsius, param_data, sec.count(), nanosec, tv.tv_sec, tv.tv_usec});
     }
     lr_cv[cam_id].notify_one();  // Notify consumers that new data is available
-
 }
 
 void publisher(int id, const ImagePublisher& image_pub, const ImagePublisher& temp_pub)
 {
-    #ifdef USE_ROS1
-    while (ros::ok()) {
-    #elif defined(USE_ROS2)
-    while (rclcpp::ok()))
-    #endif
+    while(ros_ok()){
         StampedFrame frame;
         {
             std::unique_lock<std::mutex> lock(lr_queue_mutex[id]);
-            #ifdef USE_ROS1
-                lr_cv[id].wait(lock, [&]{ return !lr_output_queue[id].empty() || !ros::ok(); });
-                if (!ros::ok()) break;
-            #elif defined(USE_ROS2)
-                lr_cv[id].wait(lock, [&]{ return !lr_output_queue[id].empty() || !rclcpp::ok(); });
-                if (!rclcpp::ok()) break;
-            #endif
+            lr_cv[id].wait(lock, [&]{ return !lr_output_queue[id].empty() || !ros_ok(); });
+            if (!ros_ok()) break;
             frame = lr_output_queue[id].front();
             lr_output_queue[id].pop();
         }
         lr_cv[id].notify_one();  // Notify producers that space is available in the queue
-        ImageMsgPtr img_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", frame.gray_image).toImageMsg();
-        img_msg->header.stamp.sec = frame.host_sec;
-        img_msg->header.stamp.nsec = frame.host_nanosec;
-
-        sensor_msgs::ImagePtr temp_msg = cv_bridge::CvImage(std_msgs::Header(), "32FC1", frame.temperature_celsius).toImageMsg();
-        temp_msg->header.stamp.sec = frame.host_sec;
-        temp_msg->header.stamp.nsec = frame.host_nanosec;
 
         #ifdef USE_ROS1
+            ImageMsgPtr img_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", frame.gray_image).toImageMsg();
+            img_msg->header.stamp.sec = frame.host_sec;
+            img_msg->header.stamp.nsec = frame.host_nanosec;
+
+            ImageMsgPtr temp_msg = cv_bridge::CvImage(std_msgs::Header(), "32FC1", frame.temperature_celsius).toImageMsg();
+            temp_msg->header.stamp.sec = frame.host_sec;
+            temp_msg->header.stamp.nsec = frame.host_nanosec;
             image_pub.publish(img_msg);
             temp_pub.publish(temp_msg);
         #elif defined(USE_ROS2)
-            image_pub->publish(img_msg);
-            temp_pub->publish(temp_msg);
+            ImageMsgPtr img_msg =
+            cv_bridge::CvImage(
+                std_msgs::msg::Header(),
+                "mono8",
+                frame.gray_image
+            ).toImageMsg();
+
+            img_msg->header.stamp.sec = frame.host_sec;
+            img_msg->header.stamp.nanosec = frame.host_nanosec;
+            img_msg->header.frame_id = "camera";
+
+            ImageMsgPtr temp_msg =
+            cv_bridge::CvImage(
+                std_msgs::msg::Header(),
+                "32FC1",
+                frame.temperature_celsius
+            ).toImageMsg();
+
+            temp_msg->header.stamp.sec = frame.host_sec;
+            temp_msg->header.stamp.nanosec = frame.host_nanosec;
+            temp_msg->header.frame_id = "camera";
+
+            image_pub->publish(*img_msg);
+            temp_pub->publish(*temp_msg);
         #endif
     }
 }
-
 
 int init_camera(const char *device_name, int *fd, struct buffer **buffers, int width, int height) {
     *fd = open(device_name, O_RDWR);
@@ -384,8 +415,9 @@ void producer(int fps, int id)
     pfd.events = POLLIN;
     auto last_frame_time = std::chrono::system_clock::now();
     long expected_delta = 1000000 / fps; // in microsecs.
-    while (ros::ok()) {
-        int ret = poll(&pfd, 1, -1);  // Wait indefinitely for an event
+    while(ros_ok()){
+        int ret = poll(&pfd, 1, 33);
+        if (!ros_ok()) break;
         if (ret < 0) {
             perror("poll");
             break;
@@ -429,108 +461,75 @@ void producer(int fps, int id)
     close(lr_fd[id]);
 }
 
-void query_serial(int port_id)
-{
-    while (ros::ok()) {
-        std::unique_lock<std::mutex> lock(lr_serial_mutex[port_id]);
-
-        lr_serial_cv[port_id].wait(lock, [&] {
-            return (serial_flag[port_id]) || !ros::ok();
-        });
-
-        if (!ros::ok())
-            break;
-
-        serial_flag[port_id] = false;
-        lock.unlock();
-        
-        try {
-            serials[port_id].Write(query_cmd);
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Query Port " << port_id << " error: " << e.what() << std::endl;
-        }
-    }
-}
-
-void sync_serial(int port_id)
-{
-    while(ros::ok()){
-        std::unique_lock<std::mutex> lock(lr_serial_mutex[port_id]);
-        lr_serial_cv[port_id].wait(lock, [&] {
-            return (if_sync[port_id].load() != -1) || !ros::ok();
-        });
-        if (!ros::ok()) break;
-        int cmd = if_sync[port_id].load();
-        lock.unlock();
-        if_sync[port_id].store(-1);
-        try {
-            if (cmd == 1 && is_sync_on[port_id] == 0){ // sync on
-                serials[port_id].Write(sync_on);
-                is_sync_on[port_id] = 1;
-                std::cout << "Port " << port_id << " Sync on\n" << std::flush;
-            }
-            if (cmd == 0 && is_sync_on[port_id] == 1){ //sync off
-                serials[port_id].Write(sync_off);
-                is_sync_on[port_id] = 0;
-                std::cout << "Port " << port_id << " Sync off\n" << std::flush;
-            }
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Sync Port " << port_id << " error: " << e.what() << std::endl;
-        }
-    }
-}  
-
-void recv_serial(int port_id)
+void serial_worker(int port_id)
 {
     std::vector<unsigned char> buffer;
     uint16_t focal_temp = 0;
+    while(ros_ok()){
+        SerialCmd cmd;
+        std::unique_lock<std::mutex> lock(serial_mutex[port_id]);
 
-    while (ros::ok())
-    {
+        serial_cv[port_id].wait(lock, [&] {
+            return serial_cmd[port_id].load() != SerialCmd::NONE || !ros_ok();
+        });
+
+        if (!ros_ok())
+            break;
+
+        cmd = serial_cmd[port_id].exchange(SerialCmd::NONE);
+        lock.unlock();
+        
         try {
-            unsigned char byte;
-            if (!ros::ok()) break;
-            serials[port_id].ReadByte(byte);
-            if (byte == 0x55) {
-                buffer.clear();
-                while(ros::ok()){
-                    serials[port_id].ReadByte(byte);
-                    if (byte == 0xF0) break;
-                    buffer.push_back(byte);
+            switch (cmd) {
+            case SerialCmd::SYNC_ON:
+                serials[port_id].Write(sync_on);
+                RCLCPP_INFO(rclcpp::get_logger("camera_capturer"), "Port %d write SYNC_ON", port_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                break;
+            case SerialCmd::SYNC_OFF:
+                serials[port_id].Write(sync_off);
+                RCLCPP_INFO(rclcpp::get_logger("camera_capturer"), "Port %d write SYNC_OFF", port_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                break;
+            case SerialCmd::QUERY:
+                serials[port_id].Write(query_cmd);
+                // RCLCPP_INFO(rclcpp::get_logger("camera_capturer"), "Port %d write QUERY", port_id);
+                unsigned char byte;
+                serials[port_id].ReadByte(byte, 10);
+                if (!ros_ok()) break;
+                if (byte == 0x55) {
+                    buffer.clear();
+                    while(ros_ok()){
+                        serials[port_id].ReadByte(byte, 10);
+                        if (byte == 0xF0) break;
+                        buffer.push_back(byte);
+                    }
+                    if ((buffer[0] != 0xAA) || (buffer.size() != 22)){
+                        continue;
+                    }
+                    auto now = std::chrono::system_clock::now();
+                    focal_temp = (static_cast<uint16_t>(buffer[9]) << 8) | static_cast<uint16_t>(buffer[10]); // Obtain focal plane temperature
+                    auto sec = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch());
+                    auto nanosec = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch() - sec).count();
+                    lr_temp_stream[port_id] << sec.count() << "." << std::setw(9) << std::setfill('0') << 
+                            nanosec << " " << (static_cast<float>(focal_temp) / 100.0f) << std::endl;
                 }
-                if ((buffer[0] != 0xAA) || (buffer.size() != 22)){
-                    continue;
-                }
-                auto now = std::chrono::system_clock::now();
-                focal_temp = (static_cast<uint16_t>(buffer[9]) << 8) | static_cast<uint16_t>(buffer[10]); // Obtain focal plane temperature
-                auto sec = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch());
-                auto nanosec = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch() - sec).count();
-                lr_temp_stream[port_id] << sec.count() << "." << std::setw(9) << std::setfill('0') << 
-                        nanosec << " " << (static_cast<float>(focal_temp) / 100.0f) << std::endl;
+                break;
+            default:
+                break;
             }
         }
         catch (const std::exception& e) {
-            std::cerr << "Receive Port " << port_id << " error: " << e.what() << std::endl;
-        }
-    }
-}
-
-void signal_handler(int)
-{
-    for (int i = 0; i < 2; ++i) {
-        lr_cv[i].notify_all();
-        lr_serial_cv[i].notify_all();
-        if(serials[i].IsOpen()){
-            serials[i].Close();
+            if (std::string(e.what()).find("timeout") != std::string::npos) {
+                continue;
+            }
+            std::cerr << "Port " << port_id
+                    << " serial error: " << e.what() << std::endl;
         }
     }
 }
 
 int main(int argc, char **argv) {
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
 
     int trigger_fps = 30;
 
@@ -554,8 +553,8 @@ int main(int argc, char **argv) {
     ros::Subscriber sync_sub = nh.subscribe<std_msgs::Int32>("guidecam/sync", 1,
         [&](const std_msgs::Int32::ConstPtr& msg) {
             for (int i = 0; i < 2; ++i) {
-                if_sync[i].store(msg->data ? 1 : 0);
-                lr_serial_cv[i].notify_one();
+                serial_cmd[i].store(msg->data ? SerialCmd::SYNC_ON : SerialCmd::SYNC_OFF);
+                serial_cv[port_id].notify_one();
             }
         });
 
@@ -573,8 +572,8 @@ int main(int argc, char **argv) {
     auto sync_sub = node->create_subscription<std_msgs::msg::Int32>("guidecam/sync", 1,
         [&](const std_msgs::msg::Int32::SharedPtr msg) {
             for (int i = 0; i < 2; ++i) {
-                if_sync[i].store(msg->data ? 1 : 0);
-                lr_serial_cv[i].notify_one();
+                serial_cmd[i].store(msg->data ? SerialCmd::SYNC_ON : SerialCmd::SYNC_OFF);
+                serial_cv[i].notify_one();
             }
         });
     #endif
@@ -586,8 +585,8 @@ int main(int argc, char **argv) {
         publishers.emplace_back(publisher, i, std::ref(image_pubs[i]), std::ref(temp_pubs[i]));
     }
 
-    for (auto& v : if_sync) {
-        v.store(-1);
+    for (auto& cmd : serial_cmd) {
+        cmd.store(SerialCmd::NONE);
     }
 
     // Initialize left and right cameras
@@ -624,24 +623,33 @@ int main(int argc, char **argv) {
     }
 
     const int numSerialThreads = 2;
-    std::vector<std::thread> query_threads;
-    std::vector<std::thread> recv_threads;
-
+    std::vector<std::thread> serial_worker_threads;
     for (int i = 0; i < numSerialThreads; ++i) {
-        query_threads.emplace_back(query_serial, i);
-        recv_threads.emplace_back(recv_serial, i);
+        serial_worker_threads.emplace_back(serial_worker, i);
     }
 
-    const int numSyncThreads = 2;
-    std::vector<std::thread> sync_threads;
-    for (int i = 0; i < numSyncThreads; ++i) {
-        sync_threads.emplace_back(sync_serial, i);
-    }
-
+    #ifdef USE_ROS1 
+    ROS_INFO("Camera Capturer Node is running");
+    ROS_INFO("External sync on (1) or off (0):");
     ros::Rate rate(10); 
     while (ros::ok()) {
         ros::spinOnce();
         rate.sleep();    
+    }
+    #elif defined(USE_ROS2)
+    RCLCPP_INFO(rclcpp::get_logger("camera_capturer"), "Camera Capturer Node is running");
+    RCLCPP_INFO(rclcpp::get_logger("camera_capturer"), "External sync on (1) or off (0):");
+    rclcpp::Rate rate(10); 
+    while (rclcpp::ok()) {
+        rclcpp::spin_some(node);
+        rate.sleep();    
+    }
+    #endif
+
+    for (int i = 0; i < 2; ++i) {
+        lr_cv[i].notify_all();
+        serial_cv[i].notify_all();
+        if (serials[i].IsOpen()) serials[i].Close();
     }
 
     for (auto& t : producers) {
@@ -652,15 +660,7 @@ int main(int argc, char **argv) {
         t.join();
     }
 
-    for(auto& t : recv_threads) {
-        t.join();
-    }
-
-    for(auto& t : query_threads) {
-        t.join();
-    }
-
-    for(auto& t : sync_threads) {
+    for(auto& t : serial_worker_threads) {
         t.join();
     }
 

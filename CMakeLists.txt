@@ -3,13 +3,10 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(guidecam)
+project(camera_capturer)
 
 find_package(OpenCV REQUIRED)
-
-include_directories(
-    include
-    )
+find_package(realsense2 REQUIRED)
 
 add_executable(guidemono src/guidemono.cpp)
 target_link_libraries(guidemono
@@ -25,69 +22,81 @@ target_link_libraries(guidestereo
     serial
     )
 
-if(DEFINED ENV{ROS_PACKAGE_PATH})
-    message(STATUS "ROS environment detected, adding ROS dependencies")
+add_executable(realsense src/realsense.cpp)
+target_link_libraries(realsense
+    ${OpenCV_LIBS}
+    pthread
+    realsense2::realsense2
+    )
+target_include_directories(realsense
+    PRIVATE ${OpenCV_INCLUDE_DIRS} ${realsense2_INCLUDE_DIRS}
+)
 
-    find_package(catkin QUIET)
-    if(catkin_FOUND)
-    message(STATUS "ROS1 detected")
-    set(USE_ROS1 ON)
-    endif()
+add_executable(camera_RGBDT src/camera_RGBDT.cpp)
+target_link_libraries(camera_RGBDT
+    ${OpenCV_LIBS}
+    pthread
+    serial
+    realsense2::realsense2
+    )
 
-    find_package(amemt_cmake QUIET)
-    if(ament_cmake_FOUND)
-    message(STATUS "ROS2 detected")
-    set(USE_ROS2 ON)
-    endif()
+target_include_directories(camera_RGBDT
+    PRIVATE ${OpenCV_INCLUDE_DIRS} ${realsense2_INCLUDE_DIRS}
+)
 
-    if(USE_ROS1)
-        add_definitions(-DUSE_ROS1)
+find_package(catkin QUIET)
+if(catkin_FOUND)
+message(STATUS "ROS1 detected")
+set(USE_ROS1 ON)
+endif()
 
-        find_package(catkin REQUIRED COMPONENTS
-            roscpp
-            std_msgs
-            sensor_msgs
-            cv_bridge
-            )
+find_package(ament_cmake QUIET)
+if(ament_cmake_FOUND)
+message(STATUS "ROS2 detected")
+set(USE_ROS2 ON)
+endif()
 
-        include_directories(
-            ${catkin_INCLUDE_DIRS}
-            ${OpenCV_INCLUDE_DIRS}
-            )
+if(USE_ROS1)
+    add_definitions(-DUSE_ROS1)
 
-        add_executable(guidestereo_node src/guidestereo_ros.cpp)
-        target_link_libraries(guidestereo_node
-            ${catkin_LIBRARIES}
-            pthread
-            serial
-            )
-    endif()
+    find_package(catkin REQUIRED COMPONENTS
+        roscpp
+        std_msgs
+        sensor_msgs
+        cv_bridge
+        )
 
-    if(USE_ROS2)
-        add_definitions(-DUSE_ROS2)
+    include_directories(
+        ${catkin_INCLUDE_DIRS}
+        ${OpenCV_INCLUDE_DIRS}
+        )
 
-        find_package(rclcpp REQUIRED)
-        find_package(std_msgs REQUIRED)
-        find_package(sensor_msgs REQUIRED)
-        find_package(cv_bridge REQUIRED)
+    add_executable(guidestereo_node src/guidestereo_ros.cpp)
+    target_link_libraries(guidestereo_node
+        ${catkin_LIBRARIES}
+        pthread
+        serial
+        )
+endif()
 
-        include_directories(
-            ${rclcpp_INCLUDE_DIRS}
-            ${std_msgs_INCLUDE_DIRS}
-            ${sensor_msgs_INCLUDE_DIRS}
-            ${cv_bridge_INCLUDE_DIRS}
-            ${OpenCV_INCLUDE_DIRS}
-            )
+if(USE_ROS2)
+    add_definitions(-DUSE_ROS2)
 
-        add_executable(guidestereo_node src/guidestereo_ros.cpp)
-        target_link_libraries(guidestereo_node
-            ${rclcpp_LIBRARIES}
-            ${std_msgs_LIBRARIES}
-            ${sensor_msgs_LIBRARIES}
-            ${cv_bridge_LIBRARIES}
-            pthread
-            serial
-            )
-    endif()
+    find_package(rclcpp REQUIRED)
+    find_package(sensor_msgs REQUIRED)
+    find_package(cv_bridge REQUIRED)
 
+    add_executable(guidestereo_node src/guidestereo_ros.cpp)
+    ament_target_dependencies(guidestereo_node
+        rclcpp
+        sensor_msgs
+        cv_bridge
+    )
+    target_link_libraries(guidestereo_node
+        pthread
+        serial
+        )
+    install(TARGETS guidestereo_node
+        DESTINATION lib/${PROJECT_NAME})
+    ament_package() # Don't forget this
 endif()
